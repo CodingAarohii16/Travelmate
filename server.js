@@ -525,7 +525,25 @@ Schema:
     }
 
     // --- STATIC FILE SERVING ---
-    let filePath = path.join(__dirname, pathname === "/" ? "index.html" : pathname);
+    const cleanPath = path.normalize(pathname).replace(/^(\.\.[\/\\])+/, '');
+    const baseName = path.basename(cleanPath).toLowerCase();
+
+    // Deny access to sensitive files, dotfiles, and secrets
+    if (
+      baseName.startsWith('.') ||
+      baseName === 'server.js' ||
+      baseName.endsWith('.db') ||
+      baseName.endsWith('.env') ||
+      cleanPath.includes('.env')
+    ) {
+      return sendJSON({ error: "Access Denied" }, 403);
+    }
+
+    let filePath = path.join(__dirname, pathname === "/" ? "index.html" : cleanPath);
+    if (!filePath.startsWith(__dirname)) {
+      return sendJSON({ error: "Access Denied" }, 403);
+    }
+
     if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
       const ext = path.extname(filePath).toLowerCase();
       const mimeTypes = {
@@ -535,7 +553,8 @@ Schema:
         ".json": "application/json",
         ".png": "image/png",
         ".jpg": "image/jpeg",
-        ".svg": "image/svg+xml"
+        ".svg": "image/svg+xml",
+        ".ico": "image/x-icon"
       };
       res.writeHead(200, { "Content-Type": mimeTypes[ext] || "application/octet-stream" });
       fs.createReadStream(filePath).pipe(res);

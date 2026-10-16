@@ -266,46 +266,36 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupPlannerDates();
   setupFormListener();
 
-  if (window.TravelMateDB) {
+  let loadedTrips = [];
+
+  // Try backend first (frontend → backend → database → backend → frontend)
+  try {
+    const res = await fetch("/api/trips");
+    if (res.ok) {
+      loadedTrips = await res.json();
+    }
+  } catch (err) {
+    // Backend offline / static preview mode
+  }
+
+  // Fallback to IndexedDB if backend returned no trips
+  if ((!loadedTrips || loadedTrips.length === 0) && window.TravelMateDB) {
     try {
       await TravelMateDB.init();
-      const savedTrips = await TravelMateDB.getAllTrips();
-      if (savedTrips && savedTrips.length > 0) {
-        // Load the latest trip
-        const latest = savedTrips[savedTrips.length - 1];
-        savedTrips.forEach(t => addNewTripToMemoryGrid(t));
-        await loadTripFromDB(latest.id);
-      } else {
-        // Seed default initial trip into persistent DB
-        const packingItems = getPackingItemsFromUI();
-        const initialId = await TravelMateDB.saveTrip({
-          destination: currentTripData.city,
-          dates: { depDate: "2026-04-10", retDate: "2026-04-16", days: 7 },
-          budget: currentTripData.budget,
-          travellers: { count: 2, type: "Couple" },
-          preferences: { style: "Cultural & Relaxed", accommodation: currentTripData.hotel, pace: currentTripData.pace },
-          days: currentTripData.days,
-          packingItems,
-          budgetData: {
-            total: currentTripData.budget,
-            currency: currentTripData.currency,
-            flights: Math.round(currentTripData.budget * 0.32),
-            stays: Math.round(currentTripData.budget * 0.35),
-            food: Math.round(currentTripData.budget * 0.18),
-            activities: Math.round(currentTripData.budget * 0.10),
-            shopping: Math.round(currentTripData.budget * 0.05)
-          }
-        });
-        currentTripData.id = initialId;
-      }
+      loadedTrips = await TravelMateDB.getAllTrips();
     } catch (err) {
-      console.warn("DB init warning:", err);
+      console.warn("DB init notice:", err);
     }
   }
 
-  renderItinerary();
-  updatePackingProgress();
-  calculateBudgetBreakdown(currentTripData.budget, currentTripData.currency);
+  if (loadedTrips && loadedTrips.length > 0) {
+    loadedTrips.forEach(t => addNewTripToMemoryGrid(t));
+    await loadTripFromDB(loadedTrips[0].id);
+  } else {
+    renderItinerary();
+    updatePackingProgress();
+    calculateBudgetBreakdown(currentTripData.budget, currentTripData.currency);
+  }
 });
 
 // --- NAVIGATION SYSTEM ---
@@ -782,8 +772,15 @@ function updatePackingProgress() {
   }
 
   // Persist packing items to DB
-  if (currentTripData && currentTripData.id && window.TravelMateDB) {
-    TravelMateDB.savePacking(currentTripData.id, getPackingItemsFromUI()).catch(e => {});
+  if (currentTripData && currentTripData.id) {
+    if (window.TravelMateDB) {
+      TravelMateDB.savePacking(currentTripData.id, getPackingItemsFromUI()).catch(() => {});
+    }
+    fetch(`/api/trips/${currentTripData.id}/packing`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: getPackingItemsFromUI() })
+    }).catch(() => {});
   }
 }
 
@@ -918,17 +915,27 @@ function calculateBudgetBreakdown(total, currency = "₹", people = 2) {
   document.getElementById("valShopping").innerText = `${currency}${formatNum(shopping)}`;
 
   // Persist budget to DB
-  if (currentTripData && currentTripData.id && window.TravelMateDB) {
-    TravelMateDB.saveBudget(currentTripData.id, {
-      total,
-      currency,
-      perPerson,
-      flights,
-      stays,
-      food,
-      activities,
-      shopping
-    }).catch(e => {});
+  if (currentTripData && currentTripData.id) {
+    if (window.TravelMateDB) {
+      TravelMateDB.saveBudget(currentTripData.id, {
+        total,
+        currency,
+        perPerson,
+        flights,
+        stays,
+        food,
+        activities,
+        shopping
+      }).catch(() => {});
+    }
+    fetch(`/api/trips/${currentTripData.id}/budget`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        categories: ["flights", "stays", "food", "activities", "shopping"],
+        amounts: { total, currency, perPerson, flights, stays, food, activities, shopping }
+      })
+    }).catch(() => {});
   }
 }
 
@@ -973,7 +980,11 @@ function addNewTripToMemoryGrid(trip) {
       <p class="trip-desc">${escapeHtml(crewText)} • ${escapeHtml(paceText)} • ${escapeHtml(hotelText)}</p>
       <div class="trip-card-footer">
         <span class="trip-cost">${currencySymbol}${formatNum(trip.budget)}</span>
-        <button class="btn-secondary btn-sm" onclick="${trip.id ? `loadTripFromDB(${trip.id})` : `showSection('itinerary')`}">Open Itinerary</button>
+        <div style="display: flex; gap: 6px;">
+          <button class="btn-secondary btn-sm" onclick="${trip.id ? `loadTripFromDB(${trip.id})` : `showSection('itinerary')`}">Open</button>
+          ${trip.id ? `<button class="btn-secondary btn-sm" title="Edit in planner" onclick="editTrip(${trip.id})">✏️</button>` : ''}
+          ${trip.id ? `<button class="btn-secondary btn-sm" title="Delete" style="color: #c9184a;" onclick="deleteTrip(${trip.id})">🗑️</button>` : ''}
+        </div>
       </div>
     </div>
   `;
@@ -984,51 +995,141 @@ function addNewTripToMemoryGrid(trip) {
 
 // Load a trip from persistent DB into active view
 async function loadTripFromDB(tripId) {
-  if (!window.TravelMateDB) return;
-  const trips = await TravelMateDB.getAllTrips();
-  const trip = trips.find(t => t.id === tripId);
-  if (!trip) return;
+  let tripData = null;
 
-  const itinDays = await TravelMateDB.getItinerary(tripId);
-  const packing = await TravelMateDB.getPacking(tripId);
-  const budget = await TravelMateDB.getBudget(tripId);
+  // Try backend first
+  try {
+    const res = await fetch(`/api/trips/${tripId}`);
+    if (res.ok) {
+      const data = await res.json();
+      tripData = {
+        id: data.id,
+        title: `${data.destination} Scrapbook Days ✨`,
+        subtitle: `${data.dates ? (data.dates.days || 'Upcoming') + ' Days' : ''} • ${data.travellers ? (data.travellers.count || 2) + ' People' : '2 People'} • ${data.preferences ? data.preferences.style || '' : ''}`,
+        city: data.destination,
+        hotel: (data.preferences && data.preferences.accommodation) || (data.itinerary?.[0]?.hotel) || "Cosy Base",
+        pace: (data.preferences && data.preferences.pace) || "Relaxed",
+        crew: data.travellers ? `${data.travellers.count || 2} Travellers (${data.travellers.type || 'Group'})` : "2 Travellers",
+        crewCount: data.travellers ? (data.travellers.count || 2) : 2,
+        currency: data.budgetBreakdown?.amounts?.currency || "₹",
+        budget: data.budget,
+        days: data.itinerary && data.itinerary.length ? data.itinerary.map(d => ({
+          dayNum: d.day,
+          title: (d.activities && d.activities.title) || `Day ${d.day}: ${d.city}`,
+          vibe: (d.activities && d.activities.vibe) || "🌸 Adventure & Bliss",
+          hotel: d.hotel || "",
+          morning: (d.activities && d.activities.morning) || {},
+          afternoon: (d.activities && d.activities.afternoon) || {},
+          evening: (d.activities && d.activities.evening) || {}
+        })) : currentTripData.days,
+        depDate: data.dates ? (data.dates.depDate || '') : '',
+        retDate: data.dates ? (data.dates.retDate || '') : '',
+        packing: data.packing,
+        budgetBreakdown: data.budgetBreakdown
+      };
+    }
+  } catch (err) {}
 
-  currentTripData = {
-    id: trip.id,
-    title: `${trip.destination} Scrapbook Days ✨`,
-    subtitle: `${trip.dates ? (trip.dates.days || 'Upcoming') + ' Days' : ''} • ${trip.travellers ? (trip.travellers.count || 2) + ' People' : '2 People'} • ${trip.preferences ? trip.preferences.style || '' : ''}`,
-    city: trip.destination,
-    hotel: (trip.preferences && trip.preferences.accommodation) || (itinDays[0] && itinDays[0].hotel) || "Cosy Base",
-    pace: (trip.preferences && trip.preferences.pace) || "Relaxed",
-    crew: trip.travellers ? `${trip.travellers.count || 2} Travellers (${trip.travellers.type || 'Group'})` : "2 Travellers",
-    crewCount: trip.travellers ? (trip.travellers.count || 2) : 2,
-    currency: (budget && budget.amounts && budget.amounts.currency) || "₹",
-    budget: trip.budget,
-    days: itinDays && itinDays.length ? itinDays.map(d => ({
-      dayNum: d.day,
-      title: (d.activities && d.activities.title) || `Day ${d.day}: ${d.city}`,
-      vibe: (d.activities && d.activities.vibe) || "🌸 Adventure & Bliss",
-      hotel: d.hotel || "",
-      morning: (d.activities && d.activities.morning) || {},
-      afternoon: (d.activities && d.activities.afternoon) || {},
-      evening: (d.activities && d.activities.evening) || {}
-    })) : currentTripData.days,
-    depDate: trip.dates ? (trip.dates.depDate || '') : '',
-    retDate: trip.dates ? (trip.dates.retDate || '') : ''
-  };
+  // Fallback to IndexedDB
+  if (!tripData && window.TravelMateDB) {
+    const trips = await TravelMateDB.getAllTrips();
+    const trip = trips.find(t => t.id === tripId);
+    if (!trip) return;
 
+    const itinDays = await TravelMateDB.getItinerary(tripId);
+    const packing = await TravelMateDB.getPacking(tripId);
+    const budget = await TravelMateDB.getBudget(tripId);
+
+    tripData = {
+      id: trip.id,
+      title: `${trip.destination} Scrapbook Days ✨`,
+      subtitle: `${trip.dates ? (trip.dates.days || 'Upcoming') + ' Days' : ''} • ${trip.travellers ? (trip.travellers.count || 2) + ' People' : '2 People'} • ${trip.preferences ? trip.preferences.style || '' : ''}`,
+      city: trip.destination,
+      hotel: (trip.preferences && trip.preferences.accommodation) || (itinDays[0] && itinDays[0].hotel) || "Cosy Base",
+      pace: (trip.preferences && trip.preferences.pace) || "Relaxed",
+      crew: trip.travellers ? `${trip.travellers.count || 2} Travellers (${trip.travellers.type || 'Group'})` : "2 Travellers",
+      crewCount: trip.travellers ? (trip.travellers.count || 2) : 2,
+      currency: (budget && budget.amounts && budget.amounts.currency) || "₹",
+      budget: trip.budget,
+      days: itinDays && itinDays.length ? itinDays.map(d => ({
+        dayNum: d.day,
+        title: (d.activities && d.activities.title) || `Day ${d.day}: ${d.city}`,
+        vibe: (d.activities && d.activities.vibe) || "🌸 Adventure & Bliss",
+        hotel: d.hotel || "",
+        morning: (d.activities && d.activities.morning) || {},
+        afternoon: (d.activities && d.activities.afternoon) || {},
+        evening: (d.activities && d.activities.evening) || {}
+      })) : currentTripData.days,
+      depDate: trip.dates ? (trip.dates.depDate || '') : '',
+      retDate: trip.dates ? (trip.dates.retDate || '') : '',
+      packing: packing,
+      budgetBreakdown: budget
+    };
+  }
+
+  if (!tripData) return;
+  currentTripData = tripData;
   activeDayIndex = 0;
   renderItinerary();
-  if (packing && packing.length) {
-    renderPackingItems(packing);
+  if (tripData.packing && tripData.packing.length) {
+    renderPackingItems(tripData.packing);
   }
   updatePackingProgress();
 
-  if (budget && budget.amounts) {
-    syncBudgetToTrip(budget.amounts.total || trip.budget, budget.amounts.currency || "₹", trip.travellers ? trip.travellers.count : 2);
-  }
+  const totalBudget = tripData.budgetBreakdown?.amounts?.total || tripData.budget;
+  const currencySymbol = tripData.budgetBreakdown?.amounts?.currency || tripData.currency || "₹";
+  syncBudgetToTrip(totalBudget, currencySymbol, tripData.crewCount || 2);
+
   showSection("itinerary");
-  showToast(`Loaded ${trip.destination} from database! ✨`);
+  showToast(`Loaded ${tripData.city} from database! ✨`);
+}
+
+async function deleteTrip(tripId) {
+  if (!confirm("Are you sure you want to delete this trip scrapbook?")) return;
+
+  try {
+    await fetch(`/api/trips/${tripId}`, { method: "DELETE" });
+  } catch (e) {}
+
+  if (window.TravelMateDB && TravelMateDB.db) {
+    try {
+      const tx = TravelMateDB.db.transaction(["trips"], "readwrite");
+      tx.objectStore("trips").delete(tripId);
+    } catch (e) {}
+  }
+
+  const card = document.querySelector(`[data-trip-id="${tripId}"]`);
+  if (card) card.remove();
+
+  showToast("Trip deleted from scrapbook! 🗑️");
+}
+
+async function editTrip(tripId) {
+  let trip = null;
+  try {
+    const res = await fetch(`/api/trips/${tripId}`);
+    if (res.ok) trip = await res.json();
+  } catch (e) {}
+
+  if (!trip && window.TravelMateDB) {
+    const trips = await TravelMateDB.getAllTrips();
+    trip = trips.find(t => t.id === tripId);
+  }
+
+  if (!trip) return;
+
+  showSection("plan");
+  const destInput = document.getElementById("destination");
+  if (destInput) destInput.value = trip.destination || trip.city || "";
+  if (trip.dates && trip.dates.depDate) document.getElementById("departureDate").value = trip.dates.depDate;
+  if (trip.dates && trip.dates.retDate) document.getElementById("returnDate").value = trip.dates.retDate;
+  if (trip.budget) document.getElementById("tripBudget").value = trip.budget;
+  if (trip.travellers && trip.travellers.count) document.getElementById("travellerCount").value = trip.travellers.count;
+  if (trip.travellers && trip.travellers.type) document.getElementById("travellerType").value = trip.travellers.type;
+  if (trip.preferences && trip.preferences.style) document.getElementById("travelStyle").value = trip.preferences.style;
+  if (trip.preferences && trip.preferences.accommodation) document.getElementById("accommodation").value = trip.preferences.accommodation;
+
+  showToast(`Loaded ${trip.destination || 'trip'} into planner for editing! ✏️`);
 }
 
 // --- DESTINATIONS FILTER ---
