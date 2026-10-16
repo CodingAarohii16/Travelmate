@@ -261,10 +261,48 @@ let currentTripData = sampleItineraries.kyoto;
 let activeDayIndex = 0;
 
 // --- INITIALIZATION ---
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
   setupNavigation();
   setupPlannerDates();
   setupFormListener();
+
+  if (window.TravelMateDB) {
+    try {
+      await TravelMateDB.init();
+      const savedTrips = await TravelMateDB.getAllTrips();
+      if (savedTrips && savedTrips.length > 0) {
+        // Load the latest trip
+        const latest = savedTrips[savedTrips.length - 1];
+        savedTrips.forEach(t => addNewTripToMemoryGrid(t));
+        await loadTripFromDB(latest.id);
+      } else {
+        // Seed default initial trip into persistent DB
+        const packingItems = getPackingItemsFromUI();
+        const initialId = await TravelMateDB.saveTrip({
+          destination: currentTripData.city,
+          dates: { depDate: "2026-04-10", retDate: "2026-04-16", days: 7 },
+          budget: currentTripData.budget,
+          travellers: { count: 2, type: "Couple" },
+          preferences: { style: "Cultural & Relaxed", accommodation: currentTripData.hotel, pace: currentTripData.pace },
+          days: currentTripData.days,
+          packingItems,
+          budgetData: {
+            total: currentTripData.budget,
+            currency: currentTripData.currency,
+            flights: Math.round(currentTripData.budget * 0.32),
+            stays: Math.round(currentTripData.budget * 0.35),
+            food: Math.round(currentTripData.budget * 0.18),
+            activities: Math.round(currentTripData.budget * 0.10),
+            shopping: Math.round(currentTripData.budget * 0.05)
+          }
+        });
+        currentTripData.id = initialId;
+      }
+    } catch (err) {
+      console.warn("DB init warning:", err);
+    }
+  }
+
   renderItinerary();
   updatePackingProgress();
   calculateBudgetBreakdown(currentTripData.budget, currentTripData.currency);
@@ -392,6 +430,30 @@ function setupFormListener() {
       accommodation,
       pace
     });
+
+    // Save to persistent database
+    if (window.TravelMateDB) {
+      TravelMateDB.saveTrip({
+        destination: dest,
+        dates: { depDate, retDate, days: numDays },
+        budget: budgetVal,
+        travellers: { count: travellerCount, type: travellerType },
+        preferences: { style, accommodation, pace },
+        days: currentTripData.days,
+        packingItems: getPackingItemsFromUI(),
+        budgetData: {
+          total: budgetVal,
+          currency,
+          flights: Math.round(budgetVal * 0.32),
+          stays: Math.round(budgetVal * 0.35),
+          food: Math.round(budgetVal * 0.18),
+          activities: Math.round(budgetVal * 0.10),
+          shopping: Math.round(budgetVal * 0.05)
+        }
+      }).then(tripId => {
+        currentTripData.id = tripId;
+      }).catch(err => console.error("Error saving trip:", err));
+    }
 
     // Add trip to My Trips list
     addNewTripToMemoryGrid(currentTripData);
@@ -628,6 +690,55 @@ function updatePackingProgress() {
     const pct = total === 0 ? 0 : Math.round((packed / total) * 100);
     fill.style.width = `${pct}%`;
   }
+
+  // Persist packing items to DB
+  if (currentTripData && currentTripData.id && window.TravelMateDB) {
+    TravelMateDB.savePacking(currentTripData.id, getPackingItemsFromUI()).catch(e => {});
+  }
+}
+
+function getPackingItemsFromUI() {
+  const items = [];
+  const categories = ['clothes', 'toiletries', 'tech', 'documents'];
+  categories.forEach(cat => {
+    const list = document.getElementById(`list-${cat}`);
+    if (list) {
+      list.querySelectorAll('li').forEach(li => {
+        const checkbox = li.querySelector('input[type="checkbox"]');
+        const span = li.querySelector('span');
+        if (checkbox && span) {
+          items.push({
+            category: cat,
+            text: span.innerText.trim(),
+            packed: checkbox.checked
+          });
+        }
+      });
+    }
+  });
+  return items;
+}
+
+function renderPackingItems(items) {
+  if (!items || !items.length) return;
+  const categories = ['clothes', 'toiletries', 'tech', 'documents'];
+  categories.forEach(cat => {
+    const list = document.getElementById(`list-${cat}`);
+    if (list) list.innerHTML = '';
+  });
+  items.forEach(item => {
+    const list = document.getElementById(`list-${item.category}`);
+    if (list) {
+      const li = document.createElement("li");
+      li.innerHTML = `
+        <label class="check-item">
+          <input type="checkbox" ${item.packed ? "checked" : ""} onchange="updatePackingProgress()">
+          <span>${escapeHtml(item.text)}</span>
+        </label>
+      `;
+      list.appendChild(li);
+    }
+  });
 }
 
 function resetPackingList() {
@@ -715,6 +826,20 @@ function calculateBudgetBreakdown(total, currency = "₹", people = 2) {
   document.getElementById("valFood").innerText = `${currency}${formatNum(food)}`;
   document.getElementById("valActivities").innerText = `${currency}${formatNum(activities)}`;
   document.getElementById("valShopping").innerText = `${currency}${formatNum(shopping)}`;
+
+  // Persist budget to DB
+  if (currentTripData && currentTripData.id && window.TravelMateDB) {
+    TravelMateDB.saveBudget(currentTripData.id, {
+      total,
+      currency,
+      perPerson,
+      flights,
+      stays,
+      food,
+      activities,
+      shopping
+    }).catch(e => {});
+  }
 }
 
 function formatNum(num) {
@@ -726,8 +851,12 @@ function addNewTripToMemoryGrid(trip) {
   const container = document.getElementById("myTripsContainer");
   if (!container) return;
 
+  // Avoid duplicate card if already rendered
+  if (trip.id && container.querySelector(`[data-trip-id="${trip.id}"]`)) return;
+
   const card = document.createElement("div");
   card.className = "trip-polaroid-card";
+  if (trip.id) card.setAttribute("data-trip-id", trip.id);
 
   const defaultImages = [
     "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=500&q=80",
@@ -735,26 +864,81 @@ function addNewTripToMemoryGrid(trip) {
     "https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=500&q=80"
   ];
   const randomImg = defaultImages[Math.floor(Math.random() * defaultImages.length)];
+  const cityName = trip.destination || trip.city || 'Dream';
+  const depDateText = (trip.dates && trip.dates.depDate) ? trip.dates.depDate : (trip.depDate || 'Saved in DB');
+  const crewText = trip.travellers ? `${trip.travellers.count || 2} Travellers (${trip.travellers.type || 'Trip'})` : (trip.crew || '2 Travellers');
+  const paceText = (trip.preferences && trip.preferences.pace) || trip.pace || 'Relaxed';
+  const hotelText = (trip.preferences && trip.preferences.accommodation) || trip.hotel || 'Cosy Base';
+  const currencySymbol = trip.currency || '₹';
 
   card.innerHTML = `
     <div class="tape-strip mint-tape"></div>
     <div class="trip-img-wrap">
-      <img src="${randomImg}" alt="${escapeHtml(trip.city)}">
+      <img src="${randomImg}" alt="${escapeHtml(cityName)}">
       <span class="trip-badge badge-active">Active Plan 🌸</span>
     </div>
     <div class="trip-card-content">
-      <div class="trip-dates-tag">📅 ${trip.depDate || 'Upcoming'} (Trip Created)</div>
-      <h3 class="trip-name">${escapeHtml(trip.city)} Journey</h3>
-      <p class="trip-desc">${escapeHtml(trip.crew)} • ${escapeHtml(trip.pace)} • ${escapeHtml(trip.hotel)}</p>
+      <div class="trip-dates-tag">📅 ${depDateText}</div>
+      <h3 class="trip-name">${escapeHtml(cityName)} Journey</h3>
+      <p class="trip-desc">${escapeHtml(crewText)} • ${escapeHtml(paceText)} • ${escapeHtml(hotelText)}</p>
       <div class="trip-card-footer">
-        <span class="trip-cost">${trip.currency}${formatNum(trip.budget)}</span>
-        <button class="btn-secondary btn-sm" onclick="showSection('itinerary')">Open Itinerary</button>
+        <span class="trip-cost">${currencySymbol}${formatNum(trip.budget)}</span>
+        <button class="btn-secondary btn-sm" onclick="${trip.id ? `loadTripFromDB(${trip.id})` : `showSection('itinerary')`}">Open Itinerary</button>
       </div>
     </div>
   `;
 
   // Prepend to top of container
   container.insertBefore(card, container.firstChild);
+}
+
+// Load a trip from persistent DB into active view
+async function loadTripFromDB(tripId) {
+  if (!window.TravelMateDB) return;
+  const trips = await TravelMateDB.getAllTrips();
+  const trip = trips.find(t => t.id === tripId);
+  if (!trip) return;
+
+  const itinDays = await TravelMateDB.getItinerary(tripId);
+  const packing = await TravelMateDB.getPacking(tripId);
+  const budget = await TravelMateDB.getBudget(tripId);
+
+  currentTripData = {
+    id: trip.id,
+    title: `${trip.destination} Scrapbook Days ✨`,
+    subtitle: `${trip.dates ? (trip.dates.days || 'Upcoming') + ' Days' : ''} • ${trip.travellers ? (trip.travellers.count || 2) + ' People' : '2 People'} • ${trip.preferences ? trip.preferences.style || '' : ''}`,
+    city: trip.destination,
+    hotel: (trip.preferences && trip.preferences.accommodation) || (itinDays[0] && itinDays[0].hotel) || "Cosy Base",
+    pace: (trip.preferences && trip.preferences.pace) || "Relaxed",
+    crew: trip.travellers ? `${trip.travellers.count || 2} Travellers (${trip.travellers.type || 'Group'})` : "2 Travellers",
+    crewCount: trip.travellers ? (trip.travellers.count || 2) : 2,
+    currency: (budget && budget.amounts && budget.amounts.currency) || "₹",
+    budget: trip.budget,
+    days: itinDays && itinDays.length ? itinDays.map(d => ({
+      dayNum: d.day,
+      title: (d.activities && d.activities.title) || `Day ${d.day}: ${d.city}`,
+      vibe: (d.activities && d.activities.vibe) || "🌸 Adventure & Bliss",
+      hotel: d.hotel || "",
+      morning: (d.activities && d.activities.morning) || {},
+      afternoon: (d.activities && d.activities.afternoon) || {},
+      evening: (d.activities && d.activities.evening) || {}
+    })) : currentTripData.days,
+    depDate: trip.dates ? (trip.dates.depDate || '') : '',
+    retDate: trip.dates ? (trip.dates.retDate || '') : ''
+  };
+
+  activeDayIndex = 0;
+  renderItinerary();
+  if (packing && packing.length) {
+    renderPackingItems(packing);
+  }
+  updatePackingProgress();
+
+  if (budget && budget.amounts) {
+    syncBudgetToTrip(budget.amounts.total || trip.budget, budget.amounts.currency || "₹", trip.travellers ? trip.travellers.count : 2);
+  }
+  showSection("itinerary");
+  showToast(`Loaded ${trip.destination} from database! ✨`);
 }
 
 // --- DESTINATIONS FILTER ---
