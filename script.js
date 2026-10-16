@@ -393,7 +393,7 @@ function setupFormListener() {
   const form = document.getElementById("planTripForm");
   if (!form) return;
 
-  form.addEventListener("submit", (e) => {
+  form.addEventListener("submit", async (e) => {
     e.preventDefault();
 
     const dest = document.getElementById("destination").value.trim();
@@ -414,61 +414,151 @@ function setupFormListener() {
     const timeDiff = end.getTime() - start.getTime();
     let numDays = Math.ceil(timeDiff / (1000 * 3600 * 24));
     if (numDays < 1) numDays = 1;
-    if (numDays > 14) numDays = 14; // Cap for neat UI presentation
+    if (numDays > 14) numDays = 14;
 
-    // Build custom dynamic itinerary object
-    currentTripData = generateDynamicTrip({
-      dest,
-      depDate,
-      retDate,
-      numDays,
-      currency,
-      budgetVal,
-      travellerType,
-      travellerCount,
-      style,
-      accommodation,
-      pace
-    });
+    const submitBtn = form.querySelector('button[type="submit"]');
+    const originalBtnText = submitBtn ? submitBtn.innerHTML : "";
 
-    // Save to persistent database
-    if (window.TravelMateDB) {
-      TravelMateDB.saveTrip({
-        destination: dest,
-        dates: { depDate, retDate, days: numDays },
-        budget: budgetVal,
-        travellers: { count: travellerCount, type: travellerType },
-        preferences: { style, accommodation, pace },
-        days: currentTripData.days,
-        packingItems: getPackingItemsFromUI(),
-        budgetData: {
-          total: budgetVal,
-          currency,
-          flights: Math.round(budgetVal * 0.32),
-          stays: Math.round(budgetVal * 0.35),
-          food: Math.round(budgetVal * 0.18),
-          activities: Math.round(budgetVal * 0.10),
-          shopping: Math.round(budgetVal * 0.05)
-        }
-      }).then(tripId => {
-        currentTripData.id = tripId;
-      }).catch(err => console.error("Error saving trip:", err));
+    // Clear previous error
+    hideFormError();
+
+    // Loading State
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = `<span>✨ Crafting with Groq AI...</span>`;
     }
 
-    // Add trip to My Trips list
-    addNewTripToMemoryGrid(currentTripData);
+    try {
+      const response = await fetch("/generate-trip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          destination: dest,
+          depDate,
+          retDate,
+          numDays,
+          currency,
+          budgetVal,
+          travellerType,
+          travellerCount,
+          style,
+          accommodation,
+          pace
+        })
+      });
 
-    // Sync budget calculator
-    syncBudgetToTrip(currentTripData.budget, currentTripData.currency, currentTripData.crewCount);
+      if (!response.ok) {
+        const errJson = await response.json().catch(() => ({ error: "Server response error." }));
+        throw new Error(errJson.error || `HTTP ${response.status} error`);
+      }
 
-    // Render new itinerary
-    activeDayIndex = 0;
-    renderItinerary();
+      const resData = await response.json();
+      if (!resData.success || !resData.data) {
+        throw new Error(resData.error || "Invalid response from AI generator");
+      }
 
-    // Show toast & switch to itinerary view
-    showToast(`Hooray! Scrapbook page for "${dest}" created! 🌸`);
-    showSection("itinerary");
+      const aiData = resData.data;
+
+      // Update currentTripData from Groq AI output
+      currentTripData = {
+        id: resData.tripId,
+        title: aiData.summary?.title || `${dest} Scrapbook Days ✨`,
+        subtitle: aiData.summary?.subtitle || `${numDays} Days • ${travellerCount} Travellers • ${style}`,
+        city: aiData.destination || dest,
+        hotel: aiData.summary?.hotel || accommodation,
+        pace: aiData.summary?.pace || pace,
+        crew: aiData.summary?.crew || `${travellerCount} Travellers (${travellerType})`,
+        crewCount: travellerCount,
+        currency: aiData.budget?.currency || currency,
+        budget: aiData.budget?.total || budgetVal,
+        days: aiData.days || [],
+        depDate,
+        retDate
+      };
+
+      // Also persist to IndexedDB if available
+      if (window.TravelMateDB) {
+        TravelMateDB.saveTrip({
+          destination: dest,
+          dates: { depDate, retDate, days: numDays },
+          budget: budgetVal,
+          travellers: { count: travellerCount, type: travellerType },
+          preferences: { style, accommodation, pace },
+          days: currentTripData.days,
+          packingItems: aiData.packing || getPackingItemsFromUI(),
+          budgetData: aiData.budget || {
+            total: budgetVal,
+            currency,
+            flights: Math.round(budgetVal * 0.32),
+            stays: Math.round(budgetVal * 0.35),
+            food: Math.round(budgetVal * 0.18),
+            activities: Math.round(budgetVal * 0.10),
+            shopping: Math.round(budgetVal * 0.05)
+          }
+        }).catch(() => {});
+      }
+
+      // Add trip to My Trips memory album
+      addNewTripToMemoryGrid(currentTripData);
+
+      // Sync budget UI
+      syncBudgetToTrip(currentTripData.budget, currentTripData.currency, currentTripData.crewCount);
+
+      // Render AI-crafted itinerary
+      activeDayIndex = 0;
+      renderItinerary();
+
+      // Render AI-crafted packing list
+      if (aiData.packing && aiData.packing.length) {
+        renderPackingItems(aiData.packing);
+      }
+      updatePackingProgress();
+
+      // Show toast & switch to itinerary view
+      showToast(`✨ Groq AI crafted your dream journey to "${dest}"! 🌸`);
+      showSection("itinerary");
+
+    } catch (err) {
+      console.error("Trip generation error:", err);
+      showFormError(err.message || "Failed to generate trip with Groq AI.");
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalBtnText;
+      }
+    }
   });
+}
+
+function showFormError(message) {
+  let banner = document.getElementById("formErrorBanner");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "formErrorBanner";
+    banner.style.cssText = "background: #fff0f3; border: 1.5px solid #ffccd5; color: #c9184a; padding: 12px 16px; border-radius: 12px; margin-top: 15px; font-size: 0.9rem; display: flex; align-items: center; justify-content: space-between; gap: 12px;";
+    const formActions = document.querySelector(".form-actions");
+    if (formActions) formActions.parentNode.insertBefore(banner, formActions.nextSibling);
+  }
+  banner.innerHTML = `
+    <div>
+      <strong>⚠️ AI Generation Notice:</strong>
+      <div style="font-size: 0.85rem; margin-top: 2px;">${escapeHtml(message)}</div>
+    </div>
+    <button type="button" class="btn-primary btn-sm" onclick="retryTripGeneration()" style="white-space: nowrap; padding: 6px 12px; font-size: 0.85rem;">🔄 Retry</button>
+  `;
+}
+
+function hideFormError() {
+  const banner = document.getElementById("formErrorBanner");
+  if (banner) banner.remove();
+}
+
+function retryTripGeneration() {
+  hideFormError();
+  const form = document.getElementById("planTripForm");
+  if (form) {
+    form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+  }
 }
 
 // Generate rich, responsive mock itinerary data based on user input
